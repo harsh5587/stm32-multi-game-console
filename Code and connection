@@ -1,0 +1,439 @@
+| Component         | STM32 Pin      | Connection Details                       |
+| ----------------- | -------------- | ---------------------------------------- |
+| 📟 OLED VCC       | 3.3V           | Power supply                             |
+| 📟 OLED GND       | GND            | Ground                                   |
+| 📟 OLED SCL (I2C) | PB6 (I2C1_SCL) | I2C Clock                                |
+| 📟 OLED SDA (I2C) | PB7 (I2C1_SDA) | I2C Data                                 |
+| 🔊 Buzzer (+)     | PB12           | Output pin                               |
+| 🔊 Buzzer (–)     | GND            | Ground                                   |
+| 🔘 Button         | PA4            | Other side → GND (uses internal pull-up) |
+| 🎮 Joystick VRx   | PA6 (ADC_CH6)  | Analog input (X-axis control)            |
+| 🎮 Joystick VRy   | PA7 (ADC_CH7)  | Analog input (Y-axis control)            |
+| 🎮 Joystick VCC   | 3.3V           | Power supply                             |
+| 🎮 Joystick GND   | GND            | Ground                                   |
+
+----------------------------CODE------------------------------------
+#include "main.h"
+#include "ssd1306.h"
+#include "fonts.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/* --- Hardware Pins --- */
+#define BUZZER_PIN GPIO_PIN_12
+#define BUZZER_PORT GPIOB
+#define BUTTON_PIN GPIO_PIN_4
+#define BUTTON_PORT GPIOA
+
+/* --- Constants --- */
+#define MAX_BULLETS 6
+#define MAX_ENEMIES 5
+#define ROWS 8
+#define COLS 16
+#define ENEMY_COUNT 3
+#define PADDLE_W 18
+#define PADDLE_H 3
+#define B_ROWS   4
+#define B_COLS   10
+#define INITIAL_SPEED 2.5f
+#define X_OFFSET 8
+
+/* --- Game States --- */
+typedef enum {
+    STATE_SNAKE, STATE_PONG, STATE_DINO,
+    STATE_PACMAN, STATE_SHOOTER, STATE_BREAKOUT,
+    STATE_TENNIS
+} GameState;
+
+GameState current_game = STATE_SNAKE;
+
+typedef struct { int x, y; bool active; } Entity;
+typedef struct { int x, y; int speed_delay; } Enemy;
+
+I2C_HandleTypeDef hi2c1;
+ADC_HandleTypeDef hadc1;
+
+bool game_over = false, game_win = false, ai_win = false;
+char death_msg[15] = "DEAD!";
+
+/* --- Shared Game Variables --- */
+uint8_t snake_x[60], snake_y[60], snake_len, snake_dir, food_x, food_y;
+bool food_eaten = true;
+int snk_score = 0, snk_hi = 0;
+
+float ball_x, ball_y, ball_vx, ball_vy;
+int p1_y, p2_y, p1_score = 0, p2_score = 0;
+
+float dino_y = 46, dino_vy = 0, obs_x = 128, obs_speed = 4.0;
+bool is_jumping = false, is_ducking = false;
+float bird_x = 140, bird_y = 30;
+int dino_score = 0, dino_hi = 0;
+
+int pac_x, pac_y, pellets_left = 0;
+Enemy ghosts[ENEMY_COUNT];
+uint8_t maze[ROWS][COLS];
+
+int ship_x = 64, shooter_score = 0, shooter_hi = 0;
+Entity bullets[MAX_BULLETS];
+Entity enemies[MAX_ENEMIES];
+
+float bx, by, bdx, bdy;
+int breakout_px, breakout_score;
+bool bricks[B_ROWS][B_COLS];
+
+/* --- Tennis Specific Variables --- */
+int pScoreIdx = 0, aiScoreIdx = 0;
+const char* scoreStrings[] = {"0", "15", "30", "45", "WIN"};
+int tennis_playerX, tennis_aiX;
+const int tennis_playerY = 60, tennis_aiY = 2;
+
+/* --- Prototypes --- */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_ADC1_Init(void);
+uint16_t Read_ADC(uint32_t ch);
+void Buzzer_Action(int ms);
+void Reset_Current_Game(void);
+void Show_Welcome_Screen(void);
+void Generate_Maze(void);
+bool can_move_pac(int nx, int ny);
+long map_val(long x, long in_min, long in_max, long out_min, long out_max);
+int constrain_val(int x, int min, int max);
+void ResetTennisBall(bool concededByPlayer);
+
+/* --- Helpers --- */
+void Buzzer_Action(int ms) {
+    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET);
+    HAL_Delay(ms);
+    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
+}
+
+uint16_t Read_ADC(uint32_t ch) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ch; sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 5);
+    uint16_t v = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return v;
+}
+
+long map_val(long x, long in_min, long in_max, long out_min, long out_max) {
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+int constrain_val(int x, int min, int max) {
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+}
+
+void Generate_Maze(void) {
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+            if (r == 0 || r == ROWS-1 || c == 0 || c == COLS-1) maze[r][c] = 1;
+            else if (r % 2 == 0 || c % 2 == 0) maze[r][c] = 2;
+            else maze[r][c] = (rand() % 100 < 25) ? 1 : 2;
+        }
+    }
+}
+
+bool can_move_pac(int nx, int ny) {
+    int size = 5;
+    int corners_x[4] = {nx, nx + size - 1, nx, nx + size - 1};
+    int corners_y[4] = {ny, ny, ny + size - 1, ny + size - 1};
+    for(int i = 0; i < 4; i++) {
+        if (corners_x[i] < 0 || corners_x[i] > 127 || corners_y[i] < 0 || corners_y[i] > 63) return false;
+        int r = corners_y[i] / 8; int c = corners_x[i] / 8;
+        if (maze[r][c] == 1) return false;
+    }
+    return true;
+}
+
+void Show_Welcome_Screen(void) {
+    SSD1306_Fill(0);
+    SSD1306_DrawRectangle(0, 0, 127, 63, 1);
+    SSD1306_GotoXY(25, 15); SSD1306_Puts("GAMING", &Font_11x18, 1);
+    SSD1306_GotoXY(40, 35); SSD1306_Puts("HUB", &Font_11x18, 1);
+    SSD1306_UpdateScreen();
+    Buzzer_Action(100); HAL_Delay(1000);
+}
+
+void Reset_Current_Game(void) {
+    game_over = false; game_win = false; ai_win = false;
+    if (current_game == STATE_SNAKE) {
+        sprintf(death_msg, "DEAD!");
+        if(snk_score > snk_hi) snk_hi = snk_score;
+        snake_x[0] = 40; snake_y[0] = 32; snake_len = 3; snake_dir = 0; snk_score = 0;
+        for(int i=1; i<snake_len; i++) { snake_x[i] = snake_x[0]-(i*4); snake_y[i] = 32; }
+    } else if (current_game == STATE_PONG) {
+        ball_x = 64; ball_y = 32; ball_vx = 2.2; ball_vy = 1.5; p1_y = p2_y = 30; p1_score = 0; p2_score = 0;
+    } else if (current_game == STATE_DINO) {
+        sprintf(death_msg, "CRASHED!");
+        if(dino_score > dino_hi) dino_hi = dino_score;
+        dino_y = 46; dino_vy = 0; obs_x = 128; obs_speed = 4.2; bird_x = 160; dino_score = 0;
+    } else if (current_game == STATE_PACMAN) {
+        sprintf(death_msg, "CAUGHT!");
+        Generate_Maze(); pac_x = 9; pac_y = 9; pellets_left = 0;
+        for(int r=0; r<ROWS; r++) for(int c=0; c<COLS; c++) if(maze[r][c] == 2) pellets_left++;
+        ghosts[0] = (Enemy){16, 16, 3}; ghosts[1] = (Enemy){104, 48, 4}; ghosts[2] = (Enemy){104, 16, 5};
+    } else if (current_game == STATE_SHOOTER) {
+        sprintf(death_msg, "FAILED!");
+        if (shooter_score > shooter_hi) shooter_hi = shooter_score;
+        ship_x = 64; shooter_score = 0;
+        for(int i=0; i<MAX_BULLETS; i++) bullets[i].active = false;
+        for(int i=0; i<MAX_ENEMIES; i++) { enemies[i].x = rand()%120; enemies[i].y = -(rand()%60); enemies[i].active = true; }
+    } else if (current_game == STATE_BREAKOUT) {
+        sprintf(death_msg, "FAILED!");
+        breakout_score = 0; breakout_px = 55; bx = 64; by = 45; bdx = INITIAL_SPEED; bdy = -INITIAL_SPEED;
+        for(int r=0; r<B_ROWS; r++) for(int c=0; c<B_COLS; c++) bricks[r][c] = true;
+    } else if (current_game == STATE_TENNIS) {
+        pScoreIdx = 0; aiScoreIdx = 0;
+        ball_x = 64; ball_y = 32; ball_vx = 2.5; ball_vy = 3.0;
+        tennis_playerX = 43; tennis_aiX = 43;
+    }
+}
+
+/* --- Game Loops --- */
+void Run_Snake() {
+    uint16_t x = Read_ADC(ADC_CHANNEL_6), y = Read_ADC(ADC_CHANNEL_7);
+    if(x < 1000 && snake_dir != 2) snake_dir = 3; else if(x > 3000 && snake_dir != 3) snake_dir = 2;
+    else if(y < 1000 && snake_dir != 0) snake_dir = 1; else if(y > 3000 && snake_dir != 1) snake_dir = 0;
+    int nx = snake_x[0], ny = snake_y[0];
+    if(snake_dir == 0) nx+=4; else if(snake_dir == 1) nx-=4; else if(snake_dir == 2) ny-=4; else if(snake_dir == 3) ny+=4;
+    if(nx == food_x && ny == food_y) { snake_len++; snk_score++; food_eaten = true; Buzzer_Action(15); }
+    if(food_eaten) { food_x = (rand()%30)*4; food_y = (rand()%11)*4+12; food_eaten = false; }
+    for(int i=snake_len-1; i>0; i--) { snake_x[i] = snake_x[i-1]; snake_y[i] = snake_y[i-1]; }
+    snake_x[0] = nx; snake_y[0] = ny;
+    if(nx<0 || nx>124 || ny<12 || ny>60) game_over = true;
+    SSD1306_Fill(0); char b[20]; sprintf(b, "SNK:%d HI:%d", snk_score, snk_hi);
+    SSD1306_GotoXY(0,0); SSD1306_Puts(b, &Font_7x10, 1); SSD1306_DrawLine(0,10,127,10,1);
+    for(int i=0; i<snake_len; i++) SSD1306_DrawRectangle(snake_x[i], snake_y[i], 4, 4, 1);
+    SSD1306_DrawRectangle(food_x, food_y, 4, 4, 1);
+}
+
+void Run_Pong() {
+    uint16_t jx = Read_ADC(ADC_CHANNEL_6);
+    if(jx < 1300 && p1_y < 48) p1_y += 3; else if (jx > 2800 && p1_y > 12) p1_y -= 3;
+    if(p2_y+8 < ball_y) p2_y++; else p2_y--;
+    ball_x += ball_vx; ball_y += ball_vy;
+    if(ball_y <= 11 || ball_y >= 61) ball_vy *= -1;
+    if(ball_x <= 3 && ball_y >= p1_y && ball_y <= p1_y+16) { ball_vx = abs(ball_vx)+0.1; Buzzer_Action(5); }
+    if(ball_x >= 122 && ball_y >= p2_y && ball_y <= p2_y+16) { ball_vx = -(abs(ball_vx)+0.1); Buzzer_Action(5); }
+    if(ball_x < 0) { p2_score++; ball_x=64; ball_y=32; ball_vx=2.2; Buzzer_Action(50); }
+    if(ball_x > 128) { p1_score++; ball_x=64; ball_y=32; ball_vx=-2.2; Buzzer_Action(50); }
+    if (p1_score >= 5) game_win = true;
+    if (p2_score >= 5) ai_win = true;
+    SSD1306_Fill(0); char b[20]; sprintf(b, "U:%d AI:%d", p1_score, p2_score);
+    SSD1306_GotoXY(30,0); SSD1306_Puts(b, &Font_7x10, 1); SSD1306_DrawLine(0,10,127,10,1);
+    for(int i=12; i<64; i+=8) SSD1306_DrawLine(64, i, 64, i+4, 1);
+    SSD1306_DrawRectangle(0, p1_y, 3, 16, 1); SSD1306_DrawRectangle(125, p2_y, 3, 16, 1);
+    SSD1306_DrawRectangle(ball_x, ball_y, 3, 3, 1);
+}
+
+void Run_Dino() {
+    uint16_t jx = Read_ADC(ADC_CHANNEL_6);
+    if (jx > 3000 && !is_jumping) { dino_vy = -10.5; is_jumping = true; }
+    is_ducking = (jx < 1000 && !is_jumping);
+    dino_vy += 1.1; dino_y += dino_vy;
+    int dh = is_ducking ? 7 : 12;
+    if (dino_y >= 58 - dh) { dino_y = 58 - dh; dino_vy = 0; is_jumping = false; }
+    obs_x -= obs_speed;
+    if (obs_x < -15) { obs_x = 128; dino_score++; if(obs_speed < 8.5) obs_speed += 0.1; }
+    bird_x -= (obs_speed + 0.5);
+    if(bird_x < -20) { bird_x = 200 + (rand()%100); bird_y = 25 + (rand()%15); }
+    if (obs_x > 18 && obs_x < 30 && dino_y + dh > 46) game_over = true;
+    if (abs(bird_x - 25) < 8 && abs(bird_y - (dino_y + 4)) < 8) game_over = true;
+    SSD1306_Fill(0); char b[20]; sprintf(b, "DN:%d HI:%d", dino_score, dino_hi);
+    SSD1306_GotoXY(0,0); SSD1306_Puts(b, &Font_7x10, 1);
+    SSD1306_DrawLine(0, 58, 127, 58, 1);
+    if(is_ducking) SSD1306_DrawRectangle(20, dino_y, 14, 7, 1);
+    else { SSD1306_DrawRectangle(20, dino_y, 10, 12, 1); SSD1306_DrawRectangle(26, dino_y-4, 6, 6, 1); }
+    SSD1306_DrawRectangle(obs_x, 46, 6, 12, 1);
+    if(((int)bird_x / 5) % 2 == 0) SSD1306_DrawLine(bird_x, bird_y, bird_x+6, bird_y-3, 1);
+    else SSD1306_DrawLine(bird_x, bird_y, bird_x+6, bird_y+3, 1);
+}
+
+void Run_Pacman() {
+    uint16_t jx = Read_ADC(ADC_CHANNEL_6), jy = Read_ADC(ADC_CHANNEL_7);
+    int nx = pac_x, ny = pac_y;
+    if (jx > 3000) { if(can_move_pac(pac_x, pac_y - 2)) ny -= 2; }
+    else if (jx < 1000) { if(can_move_pac(pac_x, pac_y + 2)) ny += 2; }
+    if (jy > 3000) { if(can_move_pac(pac_x + 2, pac_y)) nx += 2; }
+    else if (jy < 1000) { if(can_move_pac(pac_x - 2, pac_y)) nx -= 2; }
+    pac_x = nx; pac_y = ny;
+    int pr = (pac_y + 2) / 8, pc = (pac_x + 2) / 8;
+    if (maze[pr][pc] == 2) { maze[pr][pc] = 0; pellets_left--; Buzzer_Action(2); if (pellets_left <= 0) game_win = true; }
+    for (int i = 0; i < ENEMY_COUNT; i++) {
+        if (HAL_GetTick() % ghosts[i].speed_delay == 0) {
+            int dx = (ghosts[i].x < pac_x) ? 1 : -1, dy = (ghosts[i].y < pac_y) ? 1 : -1;
+            if (rand() % 2 == 0) { if (can_move_pac(ghosts[i].x + dx, ghosts[i].y)) ghosts[i].x += dx; }
+            else { if (can_move_pac(ghosts[i].x, ghosts[i].y + dy)) ghosts[i].y += dy; }
+        }
+        if (abs(pac_x - ghosts[i].x) < 5 && abs(pac_y - ghosts[i].y) < 5) game_over = true;
+    }
+    SSD1306_Fill(0);
+    for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) {
+        if (maze[r][c] == 1) SSD1306_DrawRectangle(c*8, r*8, 7, 7, 1);
+        else if (maze[r][c] == 2) SSD1306_DrawPixel(c*8+4, r*8+4, 1);
+    }
+    SSD1306_DrawRectangle(pac_x, pac_y, 5, 5, 1);
+    for (int i = 0; i < ENEMY_COUNT; i++) SSD1306_DrawCircle(ghosts[i].x+3, ghosts[i].y+3, 3, 1);
+}
+
+void Run_Shooter() {
+    uint16_t j0 = Read_ADC(ADC_CHANNEL_6), j1 = Read_ADC(ADC_CHANNEL_7);
+    if (j1 > 3000 && ship_x < 118) ship_x += 3; else if (j1 < 1000 && ship_x > 0) ship_x -= 3;
+    static uint32_t last_fire = 0;
+    if (j0 > 3000 && HAL_GetTick() - last_fire > 250) {
+        for(int i=0; i<MAX_BULLETS; i++) if(!bullets[i].active) { bullets[i].x = ship_x + 4; bullets[i].y = 50; bullets[i].active = true; break; }
+        last_fire = HAL_GetTick();
+    }
+    for(int i=0; i<MAX_BULLETS; i++) if(bullets[i].active) { bullets[i].y -= 4; if(bullets[i].y < 10) bullets[i].active = false; }
+    for(int i=0; i<MAX_ENEMIES; i++) if(enemies[i].active) {
+        enemies[i].y += 1; if(enemies[i].y > 64) { enemies[i].y = 10; enemies[i].x = rand()%120; }
+        for(int b=0; b<MAX_BULLETS; b++) if(bullets[b].active && abs(bullets[b].x-(enemies[i].x+3))<5 && abs(bullets[b].y-(enemies[i].y+3))<5) {
+            enemies[i].y = 10; enemies[i].x = rand()%120; bullets[b].active = false; shooter_score += 10; Buzzer_Action(5);
+        }
+        if(abs((enemies[i].x+3)-(ship_x+5))<7 && enemies[i].y > 50) game_over = true;
+    }
+    SSD1306_Fill(0); char buf[20]; sprintf(buf, "S:%d H:%d", shooter_score, shooter_hi);
+    SSD1306_GotoXY(2, 0); SSD1306_Puts(buf, &Font_7x10, 1); SSD1306_DrawLine(0, 10, 127, 10, 1);
+    SSD1306_DrawLine(ship_x, 60, ship_x+10, 60, 1);
+    SSD1306_DrawLine(ship_x, 60, ship_x+5, 50, 1);
+    SSD1306_DrawLine(ship_x+10, 60, ship_x+5, 50, 1);
+    for(int i=0; i<MAX_BULLETS; i++) if(bullets[i].active) SSD1306_DrawPixel(bullets[i].x, bullets[i].y, 1);
+    for(int i=0; i<MAX_ENEMIES; i++) if(enemies[i].active) SSD1306_DrawCircle(enemies[i].x+3, enemies[i].y+3, 3, 1);
+}
+
+void Run_Breakout() {
+    uint16_t joyX = Read_ADC(ADC_CHANNEL_7);
+    if(joyX < 1200 && breakout_px > 0) breakout_px -= 5;
+    else if(joyX > 2800 && breakout_px < (128 - PADDLE_W)) breakout_px += 5;
+    bx += bdx; by += bdy;
+    if(bx <= 0 || bx >= 126) { bdx = -bdx; Buzzer_Action(5); }
+    if(by <= 12) { bdy = -bdy; Buzzer_Action(5); }
+    if(by >= 56 && bx >= breakout_px && bx <= breakout_px + PADDLE_W) { bdy = -bdy; by = 55; bdx *= 1.03f; bdy *= 1.03f; Buzzer_Action(10); }
+    bool anyBricksLeft = false;
+    for(int r=0; r<B_ROWS; r++) for(int c=0; c<B_COLS; c++) if(bricks[r][c]) {
+        anyBricksLeft = true; int brx = c * 12 + 4, bry = r * 5 + 15;
+        if(bx >= brx && bx <= brx + 10 && by >= bry && by <= bry + 4) { bricks[r][c] = false; bdy = -bdy; breakout_score += 20; Buzzer_Action(8); }
+    }
+    if(!anyBricksLeft) game_win = true;
+    if(by > 64) game_over = true;
+    SSD1306_Fill(0); char s[10]; sprintf(s, "S:%d", breakout_score);
+    SSD1306_GotoXY(0, 0); SSD1306_Puts(s, &Font_7x10, 1); SSD1306_DrawLine(0, 10, 127, 10, 1);
+    for(int r=0; r<B_ROWS; r++) for(int c=0; c<B_COLS; c++) if(bricks[r][c]) SSD1306_DrawRectangle(c*12+4, r*5+15, 10, 4, 1);
+    SSD1306_DrawRectangle(breakout_px, 59, PADDLE_W, PADDLE_H, 1); SSD1306_DrawCircle((int)bx, (int)by, 2, 1);
+}
+
+void ResetTennisBall(bool concededByPlayer) {
+    if (concededByPlayer) { ball_x = tennis_aiX + 9; ball_y = tennis_aiY + 5; ball_vy = 3; }
+    else { ball_x = tennis_playerX + 9; ball_y = tennis_playerY - 5; ball_vy = -3; }
+    ball_vx = (rand() % 2 == 0) ? 2.5 : -2.5;
+    Buzzer_Action(50);
+}
+
+void Run_Tennis() {
+    if (pScoreIdx >= 4) { game_win = true; return; }
+    if (aiScoreIdx >= 4) { ai_win = true; return; }
+    uint16_t joyX = Read_ADC(ADC_CHANNEL_7);
+    tennis_playerX = map_val(joyX, 0, 4095, X_OFFSET, X_OFFSET + 68 - PADDLE_W);
+    if (rand() % 100 > 15) {
+        if (ball_x < tennis_aiX + 9) tennis_aiX -= 2;
+        else if (ball_x > tennis_aiX + 9) tennis_aiX += 2;
+    }
+    tennis_aiX = constrain_val(tennis_aiX, X_OFFSET, X_OFFSET + 68 - PADDLE_W);
+    ball_x += ball_vx; ball_y += ball_vy;
+    if (ball_x <= X_OFFSET || ball_x >= X_OFFSET + 68) { ball_vx *= -1; Buzzer_Action(5); }
+    if (ball_y <= tennis_aiY + PADDLE_H && ball_x >= tennis_aiX && ball_x <= tennis_aiX + PADDLE_W) {
+        ball_vy = abs(ball_vy); Buzzer_Action(10);
+    }
+    if (ball_y >= tennis_playerY - PADDLE_H && ball_x >= tennis_playerX && ball_x <= tennis_playerX + PADDLE_W) {
+        ball_vy = -abs(ball_vy); Buzzer_Action(10);
+    }
+    if (ball_y < 0) { pScoreIdx++; if(pScoreIdx < 4) ResetTennisBall(false); }
+    if (ball_y > 64) { aiScoreIdx++; if(aiScoreIdx < 4) ResetTennisBall(true); }
+    SSD1306_Fill(0); SSD1306_DrawRectangle(X_OFFSET, 0, 68, 63, 1);
+    SSD1306_DrawLine(X_OFFSET, 31, X_OFFSET + 68, 31, 1);
+    SSD1306_DrawRectangle(X_OFFSET + 10, 15, 48, 32, 1);
+    SSD1306_DrawLine(X_OFFSET + 34, 15, X_OFFSET + 34, 47, 1);
+    char buf[16]; sprintf(buf, "P:%s", scoreStrings[pScoreIdx > 3 ? 4 : pScoreIdx]);
+    SSD1306_GotoXY(80, 20); SSD1306_Puts(buf, &Font_7x10, 1);
+    sprintf(buf, "AI:%s", scoreStrings[aiScoreIdx > 3 ? 4 : aiScoreIdx]);
+    SSD1306_GotoXY(80, 35); SSD1306_Puts(buf, &Font_7x10, 1);
+    SSD1306_DrawRectangle(tennis_playerX, tennis_playerY, PADDLE_W, PADDLE_H, 1);
+    SSD1306_DrawRectangle(tennis_aiX, tennis_aiY, PADDLE_W, PADDLE_H, 1);
+    SSD1306_DrawFilledCircle(ball_x, ball_y, 3, 1);
+}
+
+/* --- Main Loop --- */
+int main(void) {
+    HAL_Init(); SystemClock_Config(); MX_GPIO_Init(); MX_I2C1_Init(); MX_ADC1_Init(); SSD1306_Init();
+    srand(HAL_GetTick());
+    Show_Welcome_Screen();
+    Reset_Current_Game();
+
+    while (1) {
+        // --- Single Button Click to Switch Game ---
+        if (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN) == GPIO_PIN_RESET) {
+            HAL_Delay(250); // Debounce
+            current_game = (current_game + 1) % 7;
+            SSD1306_Fill(0); SSD1306_GotoXY(20, 25);
+            SSD1306_Puts("NEXT GAME...", &Font_7x10, 1);
+            SSD1306_UpdateScreen();
+            HAL_Delay(500);
+            Reset_Current_Game();
+        }
+
+        if (game_over || ai_win) {
+            Buzzer_Action(500); SSD1306_Fill(0);
+            SSD1306_GotoXY(20, 25); SSD1306_Puts(ai_win ? "AI WINS!" : death_msg, &Font_11x18, 1);
+            SSD1306_UpdateScreen(); HAL_Delay(1500); Reset_Current_Game();
+        } else if (game_win) {
+            for(int i=0;i<3;i++){Buzzer_Action(100); HAL_Delay(50);}
+            SSD1306_Fill(0); SSD1306_GotoXY(20, 25); SSD1306_Puts("YOU WIN!", &Font_11x18, 1);
+            SSD1306_UpdateScreen(); HAL_Delay(2000); Reset_Current_Game();
+        } else {
+            switch(current_game) {
+                case STATE_SNAKE:    Run_Snake(); break;
+                case STATE_PONG:     Run_Pong(); break;
+                case STATE_DINO:     Run_Dino(); break;
+                case STATE_PACMAN:   Run_Pacman(); break;
+                case STATE_SHOOTER:  Run_Shooter(); break;
+                case STATE_BREAKOUT: Run_Breakout(); break;
+                case STATE_TENNIS:   Run_Tennis(); break;
+            }
+            SSD1306_UpdateScreen();
+            HAL_Delay(current_game == STATE_PONG ? 5 : 20);
+        }
+    }
+}
+
+/* --- Peripheral Inits --- */
+static void MX_ADC1_Init(void) {
+    hadc1.Instance = ADC1; hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE; hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1; HAL_ADC_Init(&hadc1);
+}
+static void MX_I2C1_Init(void) {
+    hi2c1.Instance = I2C1; hi2c1.Init.ClockSpeed = 400000;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT; HAL_I2C_Init(&hi2c1);
+}
+static void MX_GPIO_Init(void) {
+    __HAL_RCC_GPIOA_CLK_ENABLE(); __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef g = {0};
+    g.Pin = BUZZER_PIN; g.Mode = GPIO_MODE_OUTPUT_PP; g.Speed = GPIO_SPEED_FREQ_LOW; HAL_GPIO_Init(BUZZER_PORT, &g);
+    g.Pin = BUTTON_PIN; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP; HAL_GPIO_Init(BUTTON_PORT, &g);
+    g.Pin = GPIO_PIN_6 | GPIO_PIN_7; g.Mode = GPIO_MODE_ANALOG; HAL_GPIO_Init(GPIOA, &g);
+}
+void SystemClock_Config(void) {
+    RCC_OscInitTypeDef o = {0}; RCC_ClkInitTypeDef c = {0};
+    o.OscillatorType = RCC_OSCILLATORTYPE_HSI; o.HSIState = RCC_HSI_ON; HAL_RCC_OscConfig(&o);
+    c.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+    c.SYSCLKSource = RCC_SYSCLKSOURCE_HSI; HAL_RCC_ClockConfig(&c, FLASH_LATENCY_0);
+}
